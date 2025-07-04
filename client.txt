@@ -1,0 +1,626 @@
+import wx
+import wx.adv
+import paramiko
+import subprocess
+import threading
+import socket
+import os
+import cv2
+import numpy as np
+from datetime import datetime, timedelta
+import time
+import psutil
+
+class IndustrialSecurityClient(wx.Frame):
+    def __init__(self):
+        super().__init__(None, title="工业智能安防系统", size=(1200, 800))
+        
+        # 设备管理
+        self.devices = [
+            {
+                "name": "设备 1",
+                "ip": "192.168.1.162",
+                "user": "long2",
+                "password": "long222",
+                "script_path": "/home/long2/projects/my_project",
+                "history_path": "/home/long2",
+                "bound": True
+            }
+        ]
+        self.current_device = self.devices[0]
+        
+        # PC端配置
+        self.pc_script_path = "D:\桌面\新建文件夹 (2)"
+        self.pc_ip = "192.168.1.166"
+        self.video_port = 5002
+        self.audio_port = 5003
+        
+        # 运行状态
+        self.is_receiving = False
+        self.receiving_thread = None
+        self.processes = {}
+        
+        # 初始化UI
+        self.init_ui()
+        
+        # 启动定时器
+        self.timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self.on_timer)
+        self.timer.Start(1000)
+        
+        # 最大化窗口
+        self.Maximize(True)
+    
+    def init_ui(self):
+        # 设置背景色
+        self.SetBackgroundColour(wx.Colour(240, 245, 250))
+        
+        # 创建主面板
+        panel = wx.Panel(self)
+        main_sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # 标题栏
+        title_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        title = wx.StaticText(panel, label="工业智能安防系统控制中心")
+        title.SetFont(wx.Font(18, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
+        title.SetForegroundColour(wx.Colour(25, 75, 125))
+        title_sizer.Add(title, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 10)
+        
+        # 系统时间
+        self.time_display = wx.StaticText(panel, label=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        self.time_display.SetFont(wx.Font(12, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL))
+        title_sizer.AddStretchSpacer(1)
+        title_sizer.Add(self.time_display, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 10)
+        main_sizer.Add(title_sizer, 0, wx.EXPAND)
+        
+        # 设备控制区域
+        device_ctrl_sizer = wx.StaticBoxSizer(wx.VERTICAL, panel, "设备管理")
+        grid_sizer = wx.GridSizer(rows=1, cols=4, gap=wx.Size(10, 10))
+        
+        # 设备选择
+        device_choice_sizer = wx.BoxSizer(wx.VERTICAL)
+        device_label = wx.StaticText(panel, label="选择设备:")
+        device_label.SetFont(wx.Font(12, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
+        device_choice_sizer.Add(device_label, 0, wx.BOTTOM, 5)
+        self.device_combo = wx.ComboBox(panel, choices=[dev['name'] for dev in self.devices],
+                                       style=wx.CB_READONLY, size=(150, -1))
+        self.device_combo.SetSelection(0)
+        device_choice_sizer.Add(self.device_combo, 0, wx.EXPAND)
+        grid_sizer.Add(device_choice_sizer, 0, wx.EXPAND)
+        
+        # 设备信息
+        device_info_sizer = wx.BoxSizer(wx.VERTICAL)
+        self.device_info = wx.StaticText(panel, label=f"IP: {self.current_device['ip']}\n状态: 在线")
+        self.device_info.SetFont(wx.Font(11, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL))
+        device_info_sizer.Add(self.device_info, 0, wx.EXPAND)
+        grid_sizer.Add(device_info_sizer, 1, wx.EXPAND)
+        
+        # 绑定按钮
+        self.bind_btn = wx.Button(panel, label="绑定设备", size=(100, 35))
+        self.bind_btn.SetBackgroundColour(wx.Colour(100, 180, 100))
+        grid_sizer.Add(self.bind_btn, 0, wx.ALIGN_CENTER_VERTICAL)
+        
+        # 添加设备按钮
+        self.add_device_btn = wx.Button(panel, label="添加新设备", size=(100, 35))
+        grid_sizer.Add(self.add_device_btn, 0, wx.ALIGN_CENTER_VERTICAL)
+        
+        device_ctrl_sizer.Add(grid_sizer, 0, wx.EXPAND | wx.ALL, 10)
+        main_sizer.Add(device_ctrl_sizer, 0, wx.EXPAND | wx.ALL, 10)
+        
+        # 功能按钮区域 - 改为3行2列布局
+        function_sizer = wx.StaticBoxSizer(wx.VERTICAL, panel, "系统功能")
+        btn_grid = wx.GridSizer(rows=3, cols=2, gap=wx.Size(15, 15))
+        
+        # 实时监控按钮
+        self.realtime_btn = self.create_func_button(panel, "实时监控", "video", wx.Colour(70, 140, 210))
+        btn_grid.Add(self.realtime_btn, 0, wx.EXPAND)
+        
+        # 姿态识别按钮
+        self.pose_btn = self.create_func_button(panel, "姿态识别", "pose", wx.Colour(210, 140, 70))
+        btn_grid.Add(self.pose_btn, 0, wx.EXPAND)
+        
+        # 火焰报警按钮
+        self.fire_btn = self.create_func_button(panel, "火焰报警", "fire", wx.Colour(210, 70, 70))
+        btn_grid.Add(self.fire_btn, 0, wx.EXPAND)
+        
+        # 历史监控按钮
+        self.history_btn = self.create_func_button(panel, "历史监控", "history", wx.Colour(120, 180, 120))
+        btn_grid.Add(self.history_btn, 0, wx.EXPAND)
+        
+        # 人脸识别按钮
+        self.face_btn = self.create_func_button(panel, "人脸识别", "face", wx.Colour(150, 100, 220))
+        btn_grid.Add(self.face_btn, 0, wx.EXPAND)
+        
+        # 人数检测按钮
+        self.crowd_btn = self.create_func_button(panel, "人数检测", "crowd", wx.Colour(70, 180, 180))
+        btn_grid.Add(self.crowd_btn, 0, wx.EXPAND)
+        
+        function_sizer.Add(btn_grid, 0, wx.EXPAND | wx.ALL, 10)
+        main_sizer.Add(function_sizer, 0, wx.EXPAND | wx.ALL, 10)
+        
+        # 状态指示灯区域
+        status_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.status_light = wx.Panel(panel, size=(20, 20))
+        self.status_light.SetBackgroundColour(wx.RED)
+        status_sizer.Add(self.status_light, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        self.status_label = wx.StaticText(panel, label="状态: 未连接")
+        status_sizer.Add(self.status_label, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        
+        # 添加空位保持布局美观
+        status_sizer.AddStretchSpacer(1)
+        main_sizer.Add(status_sizer, 0, wx.EXPAND | wx.ALL, 10)
+        
+        # 扩展的日志区域 - 移除视频监控后扩大此区域
+        log_sizer = wx.StaticBoxSizer(wx.VERTICAL, panel, "系统日志")
+        self.log_text = wx.TextCtrl(panel, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.HSCROLL,
+                                  size=(-1, 450))  # 增加高度
+        self.log_text.SetFont(wx.Font(10, wx.FONTFAMILY_TELETYPE, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL))
+        log_sizer.Add(self.log_text, 1, wx.EXPAND | wx.ALL, 5)
+        main_sizer.Add(log_sizer, 1, wx.EXPAND | wx.ALL, 10)  # 比例因子设为1以占用更多空间
+        
+        panel.SetSizer(main_sizer)
+        
+        # 绑定事件
+        self.Bind(wx.EVT_CLOSE, self.on_close)
+        self.device_combo.Bind(wx.EVT_COMBOBOX, self.on_device_change)
+        self.bind_btn.Bind(wx.EVT_BUTTON, self.on_bind_device)
+        self.add_device_btn.Bind(wx.EVT_BUTTON, self.on_add_device)
+        self.realtime_btn.Bind(wx.EVT_BUTTON, self.on_realtime)
+        self.pose_btn.Bind(wx.EVT_BUTTON, self.on_pose_detection)
+        self.fire_btn.Bind(wx.EVT_BUTTON, self.on_fire_detection)
+        self.history_btn.Bind(wx.EVT_BUTTON, self.on_history)
+        self.face_btn.Bind(wx.EVT_BUTTON, self.on_face_detection)
+        self.crowd_btn.Bind(wx.EVT_BUTTON, self.on_crowd_detection)
+        
+        # 添加日志
+        self.log_message("系统启动成功")
+        self.log_message(f"当前设备: {self.current_device['name']}({self.current_device['ip']})")
+        
+        self.file_list = None  # 文件列表控件
+        self.date_combo = None  # 日期选择控件
+    
+    def create_func_button(self, parent, label, icon_name, color):
+        btn = wx.Button(parent, label=label, size=(-1, 70))
+        btn.SetFont(wx.Font(14, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
+        btn.SetBackgroundColour(color)
+        btn.SetForegroundColour(wx.WHITE)
+        
+        # 设置图标
+        if icon_name == "video":
+            icon = "📹"
+        elif icon_name == "pose":
+            icon = "🧍"
+        elif icon_name == "fire":
+            icon = "🔥"
+        elif icon_name == "history":
+            icon = "🕒"
+        elif icon_name == "face":
+            icon = "👤"
+        elif icon_name == "crowd":
+            icon = "👥"
+        else:
+            icon = ""
+        
+        # 创建垂直布局
+        btn_sizer = wx.BoxSizer(wx.VERTICAL)
+        icon_label = wx.StaticText(btn, label=icon)
+        icon_label.SetFont(wx.Font(24, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL))
+        text_label = wx.StaticText(btn, label=label)
+        text_label.SetFont(wx.Font(12, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL))
+        
+        btn_sizer.Add(icon_label, 0, wx.ALIGN_CENTER | wx.TOP, 5)
+        btn_sizer.Add(text_label, 0, wx.ALIGN_CENTER | wx.BOTTOM, 5)
+        btn.SetSizer(btn_sizer)
+        btn.Layout()
+        
+        return btn
+
+    def log_message(self, message):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        log_entry = f"[{timestamp}] {message}"
+        self.log_text.AppendText(log_entry + "\n")
+    
+    def on_timer(self, event):
+        # 更新时间显示
+        self.time_display.SetLabel(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        
+        # 更新状态灯
+        if self.is_receiving:
+            self.status_light.SetBackgroundColour(wx.GREEN)
+            self.status_label.SetLabel("状态: 视频流传输中")
+        else:
+            self.status_light.SetBackgroundColour(wx.RED)
+            self.status_label.SetLabel("状态: 未连接")
+    
+    def on_device_change(self, event):
+        idx = self.device_combo.GetSelection()
+        if idx >= 0 and idx < len(self.devices):
+            self.current_device = self.devices[idx]
+            self.device_info.SetLabel(
+                f"IP: {self.current_device['ip']}\n"
+                f"状态: {'已绑定' if self.current_device['bound'] else '未绑定'}"
+            )
+            self.log_message(f"切换到设备: {self.current_device['name']}")
+    
+    def on_bind_device(self, event):
+        if not self.current_device['bound']:
+            # 此处添加实际的设备绑定逻辑
+            self.current_device['bound'] = True
+            self.log_message(f"设备 {self.current_device['name']} 绑定成功")
+            self.device_info.SetLabel(
+                f"IP: {self.current_device['ip']}\n状态: 已绑定"
+            )
+            self.bind_btn.SetLabel("解除绑定")
+            self.bind_btn.SetBackgroundColour(wx.Colour(220, 120, 120))
+        else:
+            self.current_device['bound'] = False
+            self.log_message(f"设备 {self.current_device['name']} 解除绑定")
+            self.device_info.SetLabel(
+                f"IP: {self.current_device['ip']}\n状态: 未绑定"
+            )
+            self.bind_btn.SetLabel("绑定设备")
+            self.bind_btn.SetBackgroundColour(wx.Colour(100, 180, 100))
+    
+    def on_add_device(self, event):
+        dlg = wx.TextEntryDialog(self, "请输入设备IP地址:", "添加新设备")
+        if dlg.ShowModal() == wx.ID_OK:
+            ip = dlg.GetValue()
+            if self.validate_ip(ip):
+                new_device = {
+                    "name": f"设备 {len(self.devices) + 1}",
+                    "ip": ip,
+                    "user": "",
+                    "password": "",
+                    "script_path": "",
+                    "history_path": "",
+                    "bound": False
+                }
+                self.devices.append(new_device)
+                self.device_combo.Append(new_device["name"])
+                self.device_combo.SetStringSelection(new_device["name"])
+                self.on_device_change(None)
+                self.log_message(f"添加新设备: {ip}")
+            else:
+                wx.MessageBox("IP地址格式无效!", "错误", wx.OK | wx.ICON_ERROR)
+        dlg.Destroy()
+    
+    def validate_ip(self, ip):
+        try:
+            parts = ip.split('.')
+            if len(parts) != 4:
+                return False
+            for part in parts:
+                if not 0 <= int(part) <= 255:
+                    return False
+            return True
+        except:
+            return False
+    
+    def run_remote_script(self, script_name):
+        """在设备端运行指定脚本"""
+        device = self.current_device
+        self.log_message(f"启动设备端脚本: {script_name}...")
+        
+        try:
+            # 创建SSH连接
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(device['ip'],
+                        username=device['user'],
+                        password=device['password'])
+            
+            # 执行命令
+            command = f"cd {device['script_path']} && python3 {script_name}"
+            ssh.exec_command(command)  # 后台运行，不等待完成
+            
+            self.processes[script_name] = ssh
+            self.log_message(f"设备端脚本 {script_name} 启动成功")
+            return True
+        except Exception as e:
+            self.log_message(f"启动设备端脚本失败: {str(e)}")
+            wx.MessageBox(f"启动设备端脚本失败: {str(e)}", "错误", wx.OK | wx.ICON_ERROR)
+            return False
+    
+    def run_pc_script(self, script_name):
+        """在PC端运行脚本"""
+        self.log_message(f"启动 PC 端脚本: {script_name}...")
+        
+        try:
+            script_path = os.path.join(self.pc_script_path, script_name)
+            if os.path.exists(script_path):
+                # 启动进程
+                proc = subprocess.Popen(["python", script_path],
+                                       stdout=subprocess.PIPE,
+                                       stderr=subprocess.STDOUT,
+                                       creationflags=subprocess.CREATE_NO_WINDOW)
+                self.processes[script_name] = proc
+                
+                # 启动线程读取输出
+                threading.Thread(target=self.read_script_output,
+                               args=(proc, script_name), daemon=True).start()
+                
+                self.log_message(f"PC 端脚本 {script_name} 启动成功")
+                return True
+            else:
+                self.log_message(f"脚本不存在: {script_path}")
+                wx.MessageBox(f"脚本不存在: {script_path}", "错误", wx.OK | wx.ICON_ERROR)
+                return False
+        except Exception as e:
+            self.log_message(f"启动 PC 端脚本失败: {str(e)}")
+            wx.MessageBox(f"启动 PC 端脚本失败: {str(e)}", "错误", wx.OK | wx.ICON_ERROR)
+            return False
+    
+    def read_script_output(self, proc, script_name):
+        """读取脚本输出到日志"""
+        while proc.poll() is None:
+            line = proc.stdout.readline()
+            if line:
+                self.log_message(f"[{script_name}] {line.decode().strip()}")
+            time.sleep(0.1)
+    
+    def start_video_stream(self):
+        """启动视频流接收"""
+        if self.is_receiving:
+            self.log_message("视频流已启动，无需重复启动")
+            return
+        
+        self.is_receiving = True
+        self.receiving_thread = threading.Thread(target=self.receive_video_stream, daemon=True)
+        self.receiving_thread.start()
+        self.log_message("视频流接收启动")
+    
+    def stop_video_stream(self):
+        """停止视频流接收"""
+        self.is_receiving = False
+        
+        if self.receiving_thread and self.receiving_thread.is_alive():
+            self.receiving_thread.join(timeout=2.0)
+        
+        self.log_message("视频流接收停止")
+    
+    def receive_video_stream(self):
+        """接收视频流并显示"""
+        self.log_message("连接视频流...")
+        
+        try:
+            # 创建socket连接
+            client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client_socket.connect((self.current_device['ip'], self.video_port))
+            connection = client_socket.makefile('rb')
+            self.log_message("视频流连接成功")
+            
+            while self.is_receiving:
+                # 接收帧大小信息
+                frame_size_data = connection.read(4)
+                if len(frame_size_data) != 4:
+                    break
+                
+                frame_size = int.from_bytes(frame_size_data, byteorder='big')
+                
+                # 接收帧数据
+                frame_data = connection.read(frame_size)
+                if len(frame_data) != frame_size:
+                    break
+                
+                # 转换为图像
+                image = cv2.imdecode(np.frombuffer(frame_data, dtype=np.uint8), cv2.IMREAD_COLOR)
+            
+            # 清理
+            connection.close()
+            client_socket.close()
+            self.log_message("视频流连接关闭")
+        except Exception as e:
+            self.log_message(f"视频流接收错误: {str(e)}")
+    
+    def on_realtime(self, event):
+        try:
+            # 1.确保视频流接收程序启动
+            if not self.is_receiver_running():
+                self.start_receiver_program()  # 新添加的方法
+            
+            # 2.确保设备端服务启动
+            self.start_device_service()
+            
+            # 3.启动视频接收线程
+            self.is_receiving = True
+            self.receiving_thread = threading.Thread(target=self.receive_video_stream)
+            self.receiving_thread.start()
+        except Exception as e:
+            self.log_message(f"启动失败: {str(e)}")
+    
+    def is_receiver_running(self):
+        """检查接收程序是否在运行"""
+        for proc in psutil.process_iter(['name']):
+            if 'python' in proc.info['name'] and 'receiver.py' in proc.cmdline():
+                return True
+        return False
+    
+    def start_receiver_program(self):
+        """确保PC端接收程序启动"""
+        script_path = os.path.join(self.pc_script_path, "receiver.py")
+        
+        # 检查脚本是否存在
+        if not os.path.exists(script_path):
+            raise FileNotFoundError(f"receiver.py not found at {script_path}")
+        
+        # 启动程序
+        proc = subprocess.Popen(["python", script_path])
+        self.processes["receiver.py"] = proc
+        self.log_message("视频接收程序已启动")
+    
+    def on_pose_detection(self, event):
+        """启动姿态识别"""
+        self.log_message("启动姿态识别分析...")
+        
+        # 停止之前的处理
+        self.stop_all_processes()
+        
+        # 运行设备端脚本
+        self.run_remote_script("fall_detection.py")
+        
+        # 运行PC端脚本
+        self.run_pc_script("alert_receiver_pc.py")
+        
+        # 启动视频流
+        self.start_video_stream()
+    
+    def on_fire_detection(self, event):
+        """启动火焰检测"""
+        self.log_message("启动火焰检测分析...")
+        
+        # 停止之前的处理
+        self.stop_all_processes()
+        
+        # 运行设备端脚本
+        self.run_remote_script("fire_detection_sensor.py")
+        
+        # 运行PC端脚本
+        self.run_pc_script("pc_alert_notifier.py")
+        
+        # 启动视频流
+        self.start_video_stream()
+    
+    def on_face_detection(self, event):
+        """启动人脸识别"""
+        self.log_message("启动人脸识别分析...")
+        
+        # 停止之前的处理
+        self.stop_all_processes()
+        
+        # 运行设备端脚本
+        self.run_remote_script("face.py")
+        
+        # 运行PC端脚本
+        self.run_pc_script("pc_monitor.py")
+        
+        # 启动视频流
+        self.start_video_stream()
+    
+    def on_crowd_detection(self, event):
+        """启动人数检测"""
+        self.log_message("启动人数检测分析...")
+        
+        # 停止之前的处理
+        self.stop_all_processes()
+        
+        # 运行设备端脚本
+        self.run_remote_script("security_monitor.py")
+        
+        # 运行PC端脚本
+        self.run_pc_script("security.py")
+        
+        # 启动视频流
+        self.start_video_stream()
+    
+    def on_history(self, event):
+        """查看历史监控"""
+        self.log_message("加载历史监控数据...")
+        
+        # 创建历史数据窗口
+        history_dlg = wx.Dialog(self, title="历史监控数据", size=(900, 600))
+        panel = wx.Panel(history_dlg)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # 标题
+        title = wx.StaticText(panel, label="历史监控录像")
+        title.SetFont(wx.Font(16, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
+        sizer.Add(title, 0, wx.ALL | wx.ALIGN_CENTER, 10)
+        
+        # 设备信息显示
+        device_info = wx.StaticText(panel, label=f"设备: {self.current_device['name']} ({self.current_device['ip']})\n路径: {self.current_device['history_path']}/monitor_videos/")
+        sizer.Add(device_info, 0, wx.ALL | wx.ALIGN_CENTER, 10)
+        
+        # 日期选择
+        date_sizer = wx.BoxSizer(wx.HORIZONTAL)
+        date_label = wx.StaticText(panel, label="选择日期:")
+        date_sizer.Add(date_label, 0, wx.ALL | wx.ALIGN_CENTER_VERTICAL, 5)
+        
+        # 添加日期下拉框
+        dates = self.get_available_dates()
+        self.date_combo = wx.ComboBox(panel, choices=dates, style=wx.CB_READONLY)
+        date_sizer.Add(self.date_combo, 1, wx.ALL | wx.EXPAND, 5)
+        
+        sizer.Add(date_sizer, 0, wx.EXPAND | wx.ALL, 5)
+        
+        # 文件列表
+        self.file_list = wx.ListBox(panel, style=wx.LB_SINGLE)
+        sizer.Add(self.file_list, 1, wx.EXPAND | wx.ALL, 5)
+        
+        # 播放按钮
+        play_btn = wx.Button(panel, label="播放视频")
+        sizer.Add(play_btn, 0, wx.ALL | wx.ALIGN_CENTER, 10)
+        
+        panel.SetSizer(sizer)
+        
+        # 绑定事件
+        self.date_combo.Bind(wx.EVT_COMBOBOX, self.on_date_select)
+        play_btn.Bind(wx.EVT_BUTTON, self.on_play_history)
+        
+        history_dlg.ShowModal()
+        history_dlg.Destroy()
+    
+    def get_available_dates(self):
+        """获取可用的历史日期（模拟）"""
+        # 在实际应用中，这里应该从设备获取可用日期
+        return ["2025-07-01", "2025-07-02", "2025-07-03", "2025-07-04"]
+    
+    def on_date_select(self, event):
+        """当选择日期时更新文件列表"""
+        date = self.date_combo.GetValue()
+        self.log_message(f"加载日期: {date} 的历史文件...")
+        
+        # 清空文件列表
+        self.file_list.Clear()
+        
+        # 模拟获取文件列表
+        files = [f"security_{date}_{time}.mp4" 
+                for time in ["09:00", "12:00", "15:00", "18:00", "21:00"]]
+        
+        # 添加到列表控件
+        for file in files:
+            self.file_list.Append(file)
+    
+    def on_play_history(self, event):
+        """播放选中的历史视频"""
+        selection = self.file_list.GetSelection()
+        if selection != wx.NOT_FOUND:
+            file_name = self.file_list.GetString(selection)
+            self.log_message(f"开始播放历史视频: {file_name}")
+            
+            # 实际应用中应该从设备下载视频并播放
+            wx.MessageBox(f"即将播放视频: {file_name}", "历史回放", wx.OK | wx.ICON_INFORMATION)
+        else:
+            wx.MessageBox("请先选择一个视频文件", "错误", wx.OK | wx.ICON_ERROR)
+    
+    def stop_all_processes(self):
+        """停止所有运行的进程"""
+        self.stop_video_stream()
+        
+        # 停止PC端进程
+        for name, proc in self.processes.items():
+            if isinstance(proc, subprocess.Popen):  # PC端进程
+                proc.kill()
+                self.log_message(f"已停止PC端进程: {name}")
+            elif isinstance(proc, paramiko.SSHClient):  # SSH连接
+                proc.exec_command("pkill -f '.py'")
+                self.log_message(f"已发送停止信号到设备端脚本: {name}")
+        
+        # 清空进程字典
+        self.processes.clear()
+    
+    def on_close(self, event):
+        """关闭窗口时清理资源"""
+        self.stop_all_processes()
+        self.Destroy()
+    
+    def start_device_service(self):
+        """启动设备端服务脚本（模拟）"""
+        self.log_message("启动设备端服务...")
+        # 实际应用中应该通过SSH执行脚本
+        self.log_message("设备端服务已启动")
+
+if __name__ == "__main__":
+    app = wx.App()
+    frame = IndustrialSecurityClient()
+    frame.Show()
+    app.MainLoop()

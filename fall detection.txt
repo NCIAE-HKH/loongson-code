@@ -1,0 +1,845 @@
+import cv2
+import socket
+import time
+import struct
+import sys
+import os
+import traceback
+import datetime
+import numpy as np
+
+print("="*50)
+print("增强版动作检测系统-设备端启动")
+print("="*50)
+
+# 检查OpenCV版本
+print("OpenCV版本:", cv2.__version__)
+
+# 摄像头初始化
+def init_camera():
+    camera_paths = ['/dev/video0', '/dev/video1', '/dev/video2']
+    for path in camera_paths:
+        if os.path.exists(path):
+            print(f"尝试打开摄像头:{path}")
+            cap = cv2.VideoCapture(path)
+            if cap.isOpened():
+                print(f"成功通过{path}打开摄像头")
+                return cap
+    for i in range(0, 3):
+        cap = cv极.VideoCapture(i)
+        if cap.isOpened():
+            print(f"通过索引{i}打开摄像头")
+            return cap
+    return None
+
+cap = init_camera()
+if not cap or not cap.isOpened():
+    print("无法打开摄像头!请检查:")
+    print("1.摄像头是否连接")
+    print("2.是否加载了uvc驱动(lsmod|grep uvcvideo)")
+    print("3.用户是否有访问权限(sudo usermod -aG video $USER)")
+    sys.exit(1)
+
+# 设置分辨率
+try:
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+except:
+    try:
+        cap.set(3, 640)
+        cap.set(4, 480)
+    except:
+        print("警告: 设置分辨率失败")
+
+# 网络配置
+PC_IP = "192.168.1.166"  # 替换为实际PC的IP
+VIDEO_PORT = 5002
+ALARM_PORT = 5003
+CONNECTION_TIMEOUT = 5.0
+
+print(f"\n目标 PC: {PC_IP}")
+print(f"视频端口: {VIDEO_PORT}")
+print(f"报警端口: {ALARM_PORT}")
+print("-"*40)
+
+# 可靠的连接管理类
+class ReliableSocket:
+    def __init__(self, ip, port, socket_type="video"):
+        self.ip = ip
+        self.port = port
+        self.socket_type = socket_type
+        self.sock = None
+        self.connect()
+        self.last_connect_time = time.time()
+        self.error_count = 0
+
+    def connect(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except:
+                pass
+            self.sock = None
+            
+        try:
+            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(CONNECTION_TIMEOUT)
+            self.sock.connect((self.ip, self.port))
+            print(f"{self.socket_type}连接成功!")
+            self.last_connect_time = time.time()
+            self.error_count = 0
+            return True
+        except Exception as e:
+            print(f"连接{self.socket_type}端口失败: {str(e)}")
+            self.sock = None
+            self.error_count += 1
+            return False
+
+    def send(self, data):
+        if not self.sock:
+            if not self.connect():
+                return False
+                
+        try:
+            self.sock.sendall(data)
+            return True
+        except (ConnectionResetError, BrokenPipeError, socket.timeout) as e:
+            print(f"{self.socket_type}发送错误: {str(e)}")
+            self极ock = None
+            self.error_count += 1
+            if self.error_count > 3:
+                time.sleep(5)
+                self.error_count = 0
+            return False
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except:
+                pass
+            self.sock = None
+
+# ===== 初始化网络连接 =====
+print("="*50)
+print("初始化网络连接...")
+alarm_socket = ReliableSocket(PC_IP, ALARM_PORT, "报警")
+video_socket = ReliableSocket(PC_IP, VIDEO_PORT, "视频")
+
+if not video_socket.sock:
+    print("错误: 视频连接失败，程序退出")
+    if alarm_socket.sock:
+        alarm_socket.close()
+    sys.exit(1)
+
+print("="*50)
+print("开始动作检测...")
+
+# ===== 动作检测参数 =====
+MIN_CONTOUR_AREA = 3000
+MIN_HUMAN_HEIGHT = 80
+KEYPOINT_MATCH_THRESHOLD = 0.4
+
+# 摔倒检测参数
+FALL_ANGLE_THRESHOLD = 45
+FALL_RATIO_THRESHOLD = 0.6
+
+# 下蹲检测参数
+SQUAT_ASPECT_RATIO_MIN = 0.65
+SQUAT_ASPECT_RATIO_MAX = 1.2
+HEAD_TO_HIPS_THRESHOLD = 0.7
+
+# 倾斜检测参数
+TILT_ANGLE_THRESHOLD = 60  # 倾斜角度阈值
+
+# 姿态识别模型 - 关键点定义
+# [头部, 颈部, 左肩, 右肩, 左臀, 右臀]
+HUMAN_KEYPOINTS = np.array([
+    [0.5, 0.15],   # 头部
+    [0.5, 0.3],    # 颈部
+    [0.3, 0.4],    # 左肩
+    [0.7, 0.4],    # 右肩
+    [0.3, 0.75],   # 左臀
+    [0.7, 0.75]    # 右臀
+])
+
+# 全局状态变量
+prev_frame = None
+fall_counter = 0
+fall_detected = False
+squat_counter = 0
+squat_detected = False
+tilt_counter = 0
+tilt_detected = False
+
+# 关键点匹配函数
+def match_keypoints(contour):
+    # 获取轮廓的边界框
+    x, y, w, h = cv2.boundingRect(contour)
+    
+    # 跳过太小的轮廓
+    if h < MIN_HUMAN_HEIGHT:
+        return False, None, (0, 0, 0, 0)
+    
+    # 计算当前轮廓的关键点位置
+    current_keypoints = HUMAN_KEYPOINTS.copy()
+    current_keypoints[:, 0] = x + current_keypoints[:, 0] * w
+    current_keypoints[:, 1] = y + current_keypoints[:, 1] * h
+    
+    # 关键点匹配度计算
+    match_score = 0
+    for pt in current_keypoints:
+        # 检查点是否在轮廓内或附近
+        dist = cv2.pointPolygonTest(contour, (pt[0], pt[1]), True)
+        if dist > -10:  # 允许10像素的误差
+            match_score += max(0, 1 - abs(dist)/20)  # 根据距离计算分数
+    
+    # 标准化匹配分数
+    if len(HUMAN_KEYPOINTS) > 0:
+        match_score /= len(HUMAN_KEYPOINTS)
+    return match_score > KEYPOINT_MATCH_THRESHOLD, current_keypoints, (x, y, w, h)
+
+# 动作检测函数 - 修复拼写错误
+def detect_actions(frame):
+    global prev_frame, fall_counter, fall_detected, \
+           squat_counter, squat_detected, tilt_counter, tilt_detected
+    
+    # 使用低分辨率处理
+    small_frame = cv2.resize(frame, (320, 240))
+    gray = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
+    
+    if prev_frame is None:
+        prev_frame = gray
+        return False, False, False, frame
+    
+    # 1. 运动检测
+    frame_diff = cv2.absdiff(prev_frame, gray)
+    _, motion_mask = cv2.threshold(frame_diff, 20, 255, cv2.THRESH_BINARY)
+    
+    # 形态学操作
+    kernel = np.ones((9, 9), np.uint8)
+    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_OPEN, kernel)
+    motion_mask = cv2.morphologyEx(motion_mask, cv2.MORPH_CLOSE, kernel)
+    
+    # ===== 修复OpenCV兼容性问题 =====
+    contour_result = cv2.findContours(motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)  # 修复了这里
+    
+    # OpenCV 4.x返回(轮廓, 层级)，OpenCV 3.x返回(处理图, 轮廓, 层级)
+    if len(contour_result) == 3:
+        _, contours, _ = contour_result
+    else:
+        contours, _ = contour_result
+    # ===============================
+    
+    if not contours:
+        prev_frame = gray
+        return False, False, False, frame
+    
+    # 查找最大轮廓
+    max_contour = max(contours, key=cv2.contourArea)
+    
+    # 跳过太小的轮廓
+    if cv2.contourArea(max_contour) < MIN_CONTOUR_AREA:
+        prev_frame = gray
+        return False, False, False, frame
+    
+    # 关键点匹配
+    is_human, keypoints, (x, y, w, h) = match_keypoints(max_contour)
+    if not is_human:
+        prev_frame = gray
+        return False, False, False, frame
+    
+    # 计算姿态特征
+    # a. 高度/宽度比
+    aspect_ratio = h / float(w) if w > 0 else 0
+    
+    # b. 头部到臀部的高度差
+    head_y = keypoints[0][1]  # 头部Y坐标
+    hips_y = np.mean([keypoints[4][1], keypoints[5][1]])  # 臀部平均Y坐标
+    head_to_hips = abs(head_y - hips_y)  # 头部到臀部的垂直距离
+    
+    # c. 头部到臀部的相对位置
+    relative_position = head_to_hips / h if h > 0 else 0
+    
+    # d. 身体方向 - 肩部连线角度（用于倾斜检测）
+    left_shoulder = keypoints[2]
+    right_shoulder = keypoints[3]
+    shoulder_vector = (right_shoulder[0] - left_shoulder[0], 
+                        right_shoulder[1] - left_shoulder[1])
+    
+    # 计算肩部连线与水平线的夹角（角度制）
+    if shoulder_vector[0] != 0:
+        shoulder_angle = np.degrees(np.arctan2(shoulder_vector[1], shoulder_vector[0]))
+    else:
+        shoulder_angle = 90 if shoulder_vector[1] > 0 else -90
+    
+    # 取绝对值（0-180度）
+    shoulder_angle = abs(shoulder_angle) % 180
+    
+    # 动作检测标志
+    fall_condition = False
+    squat_condition = False
+    tilt_condition = False
+    
+    # 摔倒检测逻辑
+    if ((aspect_ratio < FALL_RATIO_THRESHOLD) or
+        (head_y > hips_y and relative_position > 0.3) or
+        ((70 < shoulder_angle < 110) or shoulder_angle < 10 or shoulder_angle > 170)):
+        fall_condition = True
+    
+    # 下蹲检测逻辑
+    elif ((SQUAT_ASPECT_RATIO_MIN < aspect_ratio < SQUAT_ASPECT_RATIO_MAX) and
+          (head_y < hips_y) and
+          (head_to_hips > 0.4 * h) and
+          (30 < shoulder_angle < 60 or 120 < shoulder_angle < 150)):
+        squat_condition = True
+    
+    # 倾斜检测逻辑
+    # 当身体倾斜角度超过阈值时触发
+    tilt_condition = abs(shoulder_angle - 90) > TILT_ANGLE_THRESHOLD
+    
+    frame_out = frame.copy()
+    scale_x = frame.shape[1] / 320.0
+    scale_y = frame.shape[0] / 240.0
+    
+    # 绘制关键点和连线
+    for i, pt in enumerate(keypoints):
+        color = (0, 255, 0)  # 绿色
+        if i == 0: color = (0, 0, 255)  # 头部红色
+        cv2.circle(frame_out, (int(pt[0]*scale_x), int(pt[1]*scale_y)), 
+                  6, color, -1)
+    
+    # 绘制身体部位连线
+    connections = [
+        (0, 1), (1, 2), (1, 3), (2, 4), (3, 5)
+    ]
+    for i, j in connections:
+        cv2.line(frame_out, 
+                 (int(keypoints[i][0]*scale_x), int(keypoints[i][1]*scale_y)),
+                 (int(keypoints[j][0]*scale_x), int(keypoints[j][1]*scale_y)),
+                 (0, 255, 255), 2)
+    
+    # 在肩部之间绘制倾斜指示线
+    cv2.line(frame_out, 
+             (int(keypoints[2][0]*scale_x), int(keypoints[2][1]*scale_y)),
+             (int(keypoints[3][0]*scale_x), int(keypoints[3][极]*scale_y)),
+             (0, 200, 255), 3)  # 橙色线表示肩部连线
+    
+    # 显示检测信息
+    cv2.putText(frame_out, f"Aspect: {aspect_ratio:.2f}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
+    cv2.putText(frame_out, f"Head/Hips: {head_y:.0f}/{hips_y:.0f}", (10, 60),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
+    cv2.putText(frame_out, f"Shoulder: {shoulder_angle:.1f}deg", (10, 90),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
+    cv2.putText(frame_out, f"Tilt: {abs(shoulder_angle - 90):.1f}deg", (10, 120),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 0), 2)
+    
+    # 摔倒检测处理
+    if fall_condition:
+        fall_counter += 1
+        if fall_counter >= 2:  # 连续2帧就判定摔倒
+            fall_detected = True
+            # 绘制红色边界框
+            cv2.rectangle(frame_out, 
+                         (int(x*scale_x), int(y*scale_y)),
+                         (int((x+w)*scale_x), int((y+h)*scale_y)),
+                         (0, 0, 255), 3)
+            # 显示摔倒文本
+            cv2.putText(frame_out, "FALL DETECTED!", (50, 150),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+    else:
+        fall_counter = max(0, fall_counter - 1)
+        fall_detected = False
+    
+    # 下蹲检测处理
+    if squat_condition:
+        squat_counter += 1
+        if squat_counter >= 2:  # 连续2帧就判定下蹲
+            squat_detected = True
+            # 绘制橙色边界框
+            cv2.rectangle(frame_out, 
+                         (int(x*scale_x), int(y*scale_y)),
+                         (int((x+w)*scale_x), int((y+h)*scale_y)),
+                         (0, 140, 255), 3)  # 橙色
+            # 显示下蹲文本
+            cv2.putText(frame_out, "SQUAT DETECTED!", (50, 180),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 140, 255), 2)
+    else:
+        squat_counter = max(0, squat_counter - 1)
+        squat_detected = False
+    
+    # 倾斜检测处理
+    if tilt_condition:
+        tilt_counter += 1
+        if tilt_counter >= 2:  # 连续2帧就判定倾斜
+            tilt_detected = True
+            # 绘制蓝色边界框
+            cv2.rectangle(frame_out, 
+                         (int(x*scale_x), int(y*scale_y)),
+                         (int((x+w)*scale_x), int((y+h)*scale_y)),
+                         (255, 0, 0), 3)  # 蓝色
+            # 显示倾斜文本
+            cv2.putText(frame_out, "TILT DETECTED!", (50, 210),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 0, 0), 2)
+    else:
+        tilt_counter = max(0, tilt_counter - 1)
+        tilt_detected = False
+    
+    prev_frame = gray
+    # 返回四个值：摔倒、下蹲、倾斜状态和图像
+    return fall_detected, squat_detected, tilt_detected, frame_out
+
+# 主循环
+try:
+    print("开始视频传输...")
+    frame_count = 0
+    last_status_time = time.time()
+    last_alarm_time = 0  # 上次发送警报的时间
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("读取帧失败，跳过...")
+            time.sleep(0.1)
+            continue
+            
+        frame_count += 1
+        
+        # 检测动作 - 接收四个返回值
+        fall_detected, squat_detected, tilt_detected, processed_frame = detect_actions(frame)
+        
+        # 压缩帧
+        _, img_data = cv2.imencode('.jpg', processed_frame, 
+                                  [cv2.IMWRITE_JPEG_QUALITY, 75])
+        
+        # 发送帧尺寸和数据
+        size_data = struct.pack(">L", len(img_data))
+        
+        # 发送视频帧
+        if video_socket.send(size_data):
+            video_socket.send(img_data.tobytes())
+        
+        # 发送警报 - 添加警报间隔限制
+        current_time = time.time()
+        if fall_detected and (current_time - last_alarm_time > 1.0):
+            if alarm_socket.send(b"FALL_DETECTED"):
+                last_alarm_time = current_time
+                ts = datetime.datetime.now().strftime('%H:%M:%S')
+                print(f"\033[91m[{ts}] 摔倒警报已发送\033[0m")
+        elif squat_detected and (current_time - last_alarm_time > 1.0):
+            if alarm_socket.send(b"SQUAT_DETECTED"):
+                last_alarm_time = current_time
+                ts = datetime.datetime.now().strftime('%H:%M:%S')
+                print(f"\033[93m[{ts}] 下蹲警报已发送\033[0m")
+        elif tilt_detected and (current_time - last_alarm_time > 1.0):
+            if alarm_socket.send(b"TILT_DETECTED"):
+                last_alarm_time = current_time
+                ts = datetime.datetime.now().strftime('%H:%M:%S')
+                print(f"\033[94m[{ts}] 倾斜警报已发送\033[0m")
+        
+        # 显示状态
+        current_time = time.time()
+        if current_time - last_status_time > 5:
+            fps = frame_count / (current_time - last_status_time)
+            print(f"状态: {fps:.1f} FPS, 已发送帧: {frame_count}")
+            last_status_time = current_time
+            frame_count = 0
+            
+        # 控制帧率
+        time.sleep(0.05)
+        
+except KeyboardInterrupt:
+    print("\n用户中断程序")
+except Exception as e:
+    print(f"未预期错误: {str(e)}")
+    traceback.print_exc()
+finally:
+    print("清理资源...")
+    cap.release()
+    video_socket.close()
+    alarm_socket.close()
+    print("程序关闭")
+
+
+import socket
+import cv2
+import numpy as np
+import struct
+import threading
+import sys
+import time
+import winsound
+import os
+
+print("="*60)
+print("动作检测监控系统-PC接收端")
+print("="*60)
+
+# 检查操作系统类型
+IS_WINDOWS = os.name == 'nt'
+
+def get_local_ip():
+    try:
+        if IS_WINDOWS:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        else:
+            # Linux/MacOS获取IP的方法
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+    except:
+        return "0.0.0.0"
+
+pc_ip = get_local_ip()
+VIDEO_PORT = 5002
+ALARM_PORT = 5003
+RUNNING = True
+
+print(f"本机 IP: {pc_ip}")
+print(f"视频端口: {VIDEO_PORT}")
+print(f"报警端口: {ALARM_PORT}")
+print("="*60)
+print("系统初始化中...")
+
+# 报警服务器 - 接收所有类型的警报
+def start_alarm_server():
+    global RUNNING
+    print("启动报警服务器...")
+    
+    alarm_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    alarm_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    alarm_sock.bind(('0.0.0.0', ALARM_PORT))
+    alarm_sock.listen(5)
+    alarm_sock.settimeout(1.0)
+    print(f"报警服务器监听中: {pc_ip}:{ALARM_PORT}")
+    
+    try:
+        while RUNNING:
+            try:
+                conn, addr = alarm_sock.accept()
+                print(f"报警连接已建立: {addr}")
+                conn.settimeout(2.0)
+                
+                while RUNNING:
+                    try:
+                        data = conn.recv(1024)
+                        if not data:
+                            print("报警连接关闭")
+                            break
+                            
+                        # 根据警报类型播放不同的声音
+                        if data == b"FALL_DETECTED":
+                            timestamp = time.strftime('%H:%M:%S')
+                            print(f"\033[91m[{timestamp}] 摔倒检测报警!\033[0m")
+                            try:
+                                # 摔倒警报（紧急）- 高频急促蜂鸣
+                                for _ in range(3):
+                                    winsound.Beep(1200, 400)  # 1200Hz, 400ms
+                                    time.sleep(0.1)
+                            except:
+                                if IS_WINDOWS:
+                                    print("声音播放失败 - 检查winsound模块")
+                                else:
+                                    print("声音播放失败 - Linux/Mac请使用beep命令")
+                        
+                        elif data == b"SQUAT_DETECTED":
+                            timestamp = time.strftime('%H:%M:%S')
+                            print(f"\033[93m[{timestamp}] 下蹲检测报警!\033[0m")
+                            try:
+                                # 下蹲警报（提示）- 中频提示声
+                                for _ in range(2):
+                                    winsound.Beep(800, 300)  # 800Hz, 300ms
+                                    time.sleep(0.2)
+                            except:
+                                print("声音播放失败")
+                        
+                        elif data == b"TILT_DETECTED":
+                            timestamp = time.strftime('%H:%M:%S')
+                            print(f"\033[94m[{timestamp}] 身体倾斜报警!\033[0m")
+                            try:
+                                # 倾斜警报（警示）- 多频交替
+                                winsound.Beep(1000, 200)
+                                winsound.Beep(800, 200)
+                                winsound.Beep(1000, 200)
+                            except:
+                                print("声音播放失败")
+                        else:
+                            print(f"收到未知报警: {data}")
+                            
+                    except socket.timeout:
+                        continue
+                    except Exception as e:
+                        print(f"报警接收错误: {str(e)}")
+                        break
+                    
+                conn.close()
+            except socket.timeout:
+                continue
+    except Exception as e:
+        print(f"报警服务器错误: {str(e)}")
+    finally:
+        alarm_sock.close()
+        print("报警服务器结束")
+
+# 视频服务器 - 接收实时视频流
+def start_video_server():
+    global RUNNING
+    print("启动视频服务器...")
+    
+    video_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    video_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    video_sock.bind(('0.0.0.0', VIDEO_PORT))
+    video_sock.listen(5)
+    video_sock.settimeout(1.0)
+    print(f"视频服务器监听中: {pc_ip}:{VIDEO_PORT}")
+    
+    # 创建视频窗口
+    window_name = "动作检测监控系统 - 按ESC退出"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 1000, 700)
+    
+    try:
+        while RUNNING:
+            try:
+                conn, addr = video_sock.accept()
+                print(f"视频连接已建立: {addr}")
+                conn.settimeout(1.0)
+                
+                payload_size = struct.calcsize(">L")
+                data = b""
+                
+                while RUNNING:
+                    try:
+                        # 接收帧大小
+                        while len(data) < payload_size:
+                            packet = conn.recv(4096)
+                            if not packet:
+                                print("视频连接关闭")
+                                RUNNING = False
+                                break
+                            data += packet
+                            
+                        if len(data) < payload_size:
+                            continue
+                            
+                        packed_size = data[:payload_size]
+                        data = data[payload_size:]
+                        frame_size = struct.unpack(">L", packed_size)[0]
+                        
+                        # 接收帧数据
+                        while len(data) < frame_size:
+                            packet = conn.recv(4096)
+                            if not packet:
+                                print("视频连接关闭")
+                                RUNNING = False
+                                break
+                            data += packet
+                            
+                        if len(data) < frame_size:
+                            continue
+                            
+                        frame_data = data[:frame_size]
+                        data = data[frame_size:]
+                        
+                        # 解码图像
+                        img = cv2.imdecode(np.frombuffer(frame_data, np.uint8), cv2.IMREAD_COLOR)
+                        
+                        if img is not None:
+                            # 显示图像
+                            cv2.imshow(window_name, img)
+                            
+                            # 检查退出键
+                            if cv2.waitKey(1) & 0xFF == 27:
+                                print("ESC键退出")
+                                RUNNING = False
+                                break
+                        else:
+                            print("图像解码失败")
+                            
+                    except socket.timeout:
+                        continue
+                    except Exception as e:
+                        print(f"视频接收错误: {str(e)}")
+                        break
+                        
+                cv2.destroyWindow(window_name)
+                conn.close()
+            except socket.timeout:
+                continue
+    except Exception as e:
+        print(f"视频服务器错误: {str(e)}")
+    finally:
+        cv2.destroyAllWindows()
+        video_sock.close()
+        print("视频服务器结束")
+
+# 启动服务器线程
+print("="*60)
+print("启动系统线程...")
+alarm_thread = threading.Thread(target=start_alarm_server, daemon=True)
+video_thread = threading.Thread(target=start_video_server, daemon=True)
+
+alarm_thread.start()
+video_thread.start()
+
+print("系统已启动，等待设备连接...")
+print("按 Ctrl+C 退出程序")
+
+# 系统状态监控
+try:
+    while alarm_thread.is_alive() or video_thread.is_alive():
+        time.sleep(1)
+except KeyboardInterrupt:
+    RUNNING = False
+    print("\n中断信号, 关闭程序...")
+    alarm_thread.join(1.0)
+    video_thread.join(1.0)
+finally:
+    print("系统关闭")
+
+
+
+
+
+监控录像
+monitor.py
+import cv2
+import os
+import time
+from datetime import datetime, timedelta
+import threading
+import re
+
+# 配置参数
+VIDEO_DIR = "/home/long2/monitor_videos"  # 使用图片中显示的路径
+RESOLUTION = (640, 480)  # 建议分辨率
+FPS = 15                 # 帧率设置
+CLEAN_INTERVAL = 3600    # 每小时清理一次旧文件
+
+def ensure_dir_exists():
+    """确保存储目录存在"""
+    if not os.path.exists(VIDEO_DIR):
+        os.makedirs(VIDEO_DIR)
+        print(f"创建存储目录: {VIDEO_DIR}")
+
+def get_current_filename():
+    """生成带日期时间的文件名"""
+    now = datetime.now()
+    # 与图片中的文件名格式完全一致
+    return os.path.join(VIDEO_DIR, f"monitor_{now.strftime('%Y%m%d_%H')}.mp4")
+
+def clean_old_videos():
+    """立即删除超过7天的视频文件（严格日期比较）"""
+    now = datetime.now()
+    seven_days_ago = now - timedelta(days=7)
+    deleted_count = 0
+    print(f"[清理任务] 开始清理 {seven_days_ago.strftime('%Y-%m-%d')} 之前的视频文件")
+    
+    for filename in os.listdir(VIDEO_DIR):
+        if not (filename.startswith("monitor_") and filename.endswith(".mp4")):
+            continue
+            
+        try:
+            # 1. 使用正则表达式精确匹配文件名格式（图片中的格式）
+            match = re.match(r"monitor_(\d{8})_\d{2}\.mp4", filename)
+            if not match:
+                print(f"文件名格式不匹配: {filename}")
+                continue
+                
+            date_str = match.group(1)
+            
+            # 2. 解析文件创建日期（忽略小时信息）
+            file_date = datetime.strptime(date_str, "%Y%m%d")
+            
+            # 3. 计算文件保存天数（严格日期比较）
+            if file_date.date() <= (now - timedelta(days=7)).date():
+                file_path = os.path.join(VIDEO_DIR, filename)
+                os.remove(file_path)
+                print(f"已删除过期文件: {filename} (创建于: {file_date.date()})")
+                deleted_count += 1
+                
+        except Exception as e:
+            print(f"清理文件错误 {filename}: {str(e)}")
+    
+    print(f"[清理任务] 完成! 共删除 {deleted_count} 个过期文件")
+    return deleted_count > 0
+
+def record_video():
+    ensure_dir_exists()
+    
+    # 在录制开始前立即执行一次清理
+    print("启动时立即执行过期文件清理...")
+    clean_old_videos()
+    
+    cap = cv2.VideoCapture(0)  # 打开UVC摄像头
+    
+    if not cap.isOpened():
+        print("错误：无法打开摄像头！")
+        return
+
+    # 设置摄像头参数
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, RESOLUTION[0])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RESOLUTION[1])
+    cap.set(cv2.CAP_PROP_FPS, FPS)
+
+    # 视频编码设置 (龙芯兼容MJPG编码)
+    fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+    writer = None
+    last_hour = -1
+    last_clean_time = time.time()
+
+    print("开始监控录制...")
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("警告：获取帧失败，重试中...")
+                time.sleep(1)
+                continue
+
+            current_hour = datetime.now().hour
+            
+            # 每小时或首次启动时创建新文件
+            if writer is None or current_hour != last_hour:
+                if writer is not None:
+                    writer.release()
+                    print(f"关闭上一个视频文件")
+                
+                filename = get_current_filename()
+                writer = cv2.VideoWriter(filename, fourcc, FPS, RESOLUTION)
+                last_hour = current_hour
+                print(f"新视频文件: {filename}")
+            
+            writer.write(frame)  # 写入帧
+            
+            # 每小时自动清理旧文件
+            current_time = time.time()
+            if current_time - last_clean_time > CLEAN_INTERVAL:
+                # 记录下一个清理时间
+                next_clean_time = datetime.fromtimestamp(current_time + CLEAN_INTERVAL)
+                
+                # 在单独线程中执行清理操作
+                threading.Thread(target=clean_old_videos).start()
+                last_clean_time = current_time
+                print(f"[清理计划] 下次清理时间: {next_clean_time.strftime('%m-%d %H:%M')}")
+                
+    except KeyboardInterrupt:
+        print("监控已手动停止")
+    except Exception as e:
+        print(f"录制过程中发生错误: {str(e)}")
+    finally:
+        if cap.isOpened():
+            cap.release()
+        if writer is not None:
+            writer.release()
+        print("录制服务已终止")
+
+if __name__ == "__main__":
+    record_video()

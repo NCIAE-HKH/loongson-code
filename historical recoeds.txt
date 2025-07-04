@@ -1,0 +1,26 @@
+http_server.py
+
+from http.server import HTTPServer, SimpleHTTPRequestHandler
+import os
+
+VIDEO_DIR = "/home/long2/monitor_videos"
+PORT = 8000  # Web服务端口
+
+class CustomHandler(SimpleHTTPRequestHandler):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, directory=VIDEO_DIR, **kwargs)
+    
+    def log_message(self, format, *args):
+        pass  # 禁用访问日志（减少磁盘写入）
+
+def run_server():
+    if not os.path.exists(VIDEO_DIR):
+        os.makedirs(VIDEO_DIR)
+    
+    server_address = ('0.0.0.0', PORT)
+    httpd = HTTPServer(server_address, CustomHandler)
+    print(f"HTTP服务已启动: http://<龙芯派IP>:{PORT}")
+    httpd.serve_forever()
+
+if __name__ == '__main__':
+run_server()
