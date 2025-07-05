@@ -10,6 +10,7 @@ import numpy as np
 from datetime import datetime, timedelta
 import time
 import psutil
+import tempfile
 
 class IndustrialSecurityClient(wx.Frame):
     def __init__(self):
@@ -23,7 +24,7 @@ class IndustrialSecurityClient(wx.Frame):
                 "user": "long2",
                 "password": "long222",
                 "script_path": "/home/long2/projects/my_project",
-                "history_path": "/home/long2",
+                "history_path": "/home/long2/monitor_videos",  # 更新历史路径
                 "bound": True
             }
         ]
@@ -272,7 +273,7 @@ class IndustrialSecurityClient(wx.Frame):
                     "user": "",
                     "password": "",
                     "script_path": "",
-                    "history_path": "",
+                    "history_path": "/home/long2/monitor_videos",  # 默认历史路径
                     "bound": False
                 }
                 self.devices.append(new_device)
@@ -527,7 +528,7 @@ class IndustrialSecurityClient(wx.Frame):
         sizer.Add(title, 0, wx.ALL | wx.ALIGN_CENTER, 10)
         
         # 设备信息显示
-        device_info = wx.StaticText(panel, label=f"设备: {self.current_device['name']} ({self.current_device['ip']})\n路径: {self.current_device['history_path']}/monitor_videos/")
+        device_info = wx.StaticText(panel, label=f"设备: {self.current_device['name']} ({self.current_device['ip']})\n路径: {self.current_device['history_path']}")
         sizer.Add(device_info, 0, wx.ALL | wx.ALIGN_CENTER, 10)
         
         # 日期选择
@@ -543,54 +544,206 @@ class IndustrialSecurityClient(wx.Frame):
         sizer.Add(date_sizer, 0, wx.EXPAND | wx.ALL, 5)
         
         # 文件列表
-        self.file_list = wx.ListBox(panel, style=wx.LB_SINGLE)
+        self.file_list = wx.ListCtrl(panel, style=wx.LC_REPORT | wx.LC_SINGLE_SEL)
+        self.file_list.InsertColumn(0, "文件名", width=300)
+        self.file_list.InsertColumn(1, "大小", width=100)
+        self.file_list.InsertColumn(2, "修改时间", width=150)
         sizer.Add(self.file_list, 1, wx.EXPAND | wx.ALL, 5)
         
-        # 播放按钮
+        # 按钮区域
+        btn_sizer = wx.BoxSizer(wx.HORIZONTAL)
         play_btn = wx.Button(panel, label="播放视频")
-        sizer.Add(play_btn, 0, wx.ALL | wx.ALIGN_CENTER, 10)
+        refresh_btn = wx.Button(panel, label="刷新列表")
+        btn_sizer.Add(play_btn, 0, wx.ALL | wx.ALIGN_CENTER, 10)
+        btn_sizer.Add(refresh_btn, 0, wx.ALL | wx.ALIGN_CENTER, 10)
+        sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER)
         
         panel.SetSizer(sizer)
         
         # 绑定事件
         self.date_combo.Bind(wx.EVT_COMBOBOX, self.on_date_select)
         play_btn.Bind(wx.EVT_BUTTON, self.on_play_history)
+        refresh_btn.Bind(wx.EVT_BUTTON, self.on_refresh_history)
+        
+        # 初始加载文件列表
+        if dates:
+            self.date_combo.SetSelection(0)
+            self.load_files_for_date(dates[0])
         
         history_dlg.ShowModal()
         history_dlg.Destroy()
     
     def get_available_dates(self):
-        """获取可用的历史日期（模拟）"""
-        # 在实际应用中，这里应该从设备获取可用日期
-        return ["2025-07-01", "2025-07-02", "2025-07-03", "2025-07-04"]
+        """获取最近7天的可用日期"""
+        # 连接到设备获取实际日期列表
+        dates = []
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(
+                self.current_device['ip'],
+                username=self.current_device['user'],
+                password=self.current_device['password']
+            )
+            
+            # 获取最近7天的日期
+            today = datetime.now().date()
+            date_list = [today - timedelta(days=i) for i in range(7)]
+            date_str_list = [d.strftime("%Y%m%d") for d in date_list]
+            
+            # 检查哪些日期有文件
+            for date_str in date_str_list:
+                _, stdout, _ = ssh.exec_command(
+                    f"ls {self.current_device['history_path']}/*_{date_str}_* 2>/dev/null"
+                )
+                if stdout.read().decode().strip():
+                    dates.append(date_str)
+            
+            ssh.close()
+        except Exception as e:
+            self.log_message(f"获取历史日期失败: {str(e)}")
+            # 使用模拟数据作为后备
+            today = datetime.now().date()
+            dates = [(today - timedelta(days=i)).strftime("%Y%m%d") for i in range(7)]
+        
+        return dates
     
     def on_date_select(self, event):
         """当选择日期时更新文件列表"""
         date = self.date_combo.GetValue()
+        if date:
+            self.load_files_for_date(date)
+    
+    def on_refresh_history(self, event):
+        """刷新历史文件列表"""
+        date = self.date_combo.GetValue()
+        if date:
+            self.load_files_for_date(date)
+        else:
+            wx.MessageBox("请先选择一个日期", "错误", wx.OK | wx.ICON_ERROR)
+    
+    def load_files_for_date(self, date):
+        """加载指定日期的视频文件"""
+        self.file_list.DeleteAllItems()
         self.log_message(f"加载日期: {date} 的历史文件...")
         
-        # 清空文件列表
-        self.file_list.Clear()
-        
-        # 模拟获取文件列表
-        files = [f"security_{date}_{time}.mp4" 
-                for time in ["09:00", "12:00", "15:00", "18:00", "21:00"]]
-        
-        # 添加到列表控件
-        for file in files:
-            self.file_list.Append(file)
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(
+                self.current_device['ip'],
+                username=self.current_device['user'],
+                password=self.current_device['password']
+            )
+            
+            # 获取文件列表
+            _, stdout, _ = ssh.exec_command(
+                f"ls -l --time-style=full-iso {self.current_device['history_path']}/*_{date}_* 2>/dev/null"
+            )
+            files = stdout.read().decode().splitlines()
+            
+            for file_info in files:
+                parts = file_info.split()
+                if len(parts) >= 9:
+                    filename = parts[-1].split('/')[-1]
+                    size = parts[4]
+                    mod_time = " ".join(parts[5:8])
+                    
+                    index = self.file_list.InsertItem(self.file_list.GetItemCount(), filename)
+                    self.file_list.SetItem(index, 1, size)
+                    self.file_list.SetItem(index, 2, mod_time)
+            
+            ssh.close()
+            self.log_message(f"找到 {len(files)} 个视频文件")
+            
+        except Exception as e:
+            self.log_message(f"加载文件失败: {str(e)}")
+            wx.MessageBox(f"加载文件失败: {str(e)}", "错误", wx.OK | wx.ICON_ERROR)
     
     def on_play_history(self, event):
         """播放选中的历史视频"""
-        selection = self.file_list.GetSelection()
-        if selection != wx.NOT_FOUND:
-            file_name = self.file_list.GetString(selection)
-            self.log_message(f"开始播放历史视频: {file_name}")
-            
-            # 实际应用中应该从设备下载视频并播放
-            wx.MessageBox(f"即将播放视频: {file_name}", "历史回放", wx.OK | wx.ICON_INFORMATION)
-        else:
+        selection = self.file_list.GetFirstSelected()
+        if selection == -1:
             wx.MessageBox("请先选择一个视频文件", "错误", wx.OK | wx.ICON_ERROR)
+            return
+        
+        file_name = self.file_list.GetItemText(selection)
+        date = self.date_combo.GetValue()
+        self.log_message(f"开始播放历史视频: {file_name}")
+        
+        # 创建进度对话框
+        progress_dlg = wx.ProgressDialog(
+            "下载视频",
+            f"正在下载 {file_name}...",
+            maximum=100,
+            parent=self,
+            style=wx.PD_APP_MODAL | wx.PD_AUTO_HIDE
+        )
+        
+        # 在后台线程中下载并播放视频
+        threading.Thread(
+            target=self.download_and_play_video,
+            args=(file_name, progress_dlg),
+            daemon=True
+        ).start()
+    
+    def download_and_play_video(self, file_name, progress_dlg):
+        """下载并播放视频"""
+        try:
+            remote_path = f"{self.current_device['history_path']}/{file_name}"
+            local_path = os.path.join(tempfile.gettempdir(), file_name)
+            
+            # 使用SFTP下载文件
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(
+                self.current_device['ip'],
+                username=self.current_device['user'],
+                password=self.current_device['password']
+            )
+            
+            sftp = ssh.open_sftp()
+            
+            # 获取文件大小用于进度显示
+            file_size = sftp.stat(remote_path).st_size
+            downloaded = 0
+            
+            # 下载文件
+            with sftp.open(remote_path, "rb") as remote_file:
+                with open(local_path, "wb") as local_file:
+                    while True:
+                        chunk = remote_file.read(32768)
+                        if not chunk:
+                            break
+                        local_file.write(chunk)
+                        downloaded += len(chunk)
+                        progress = int((downloaded / file_size) * 100)
+                        wx.CallAfter(progress_dlg.Update, progress, f"下载中... {downloaded//1024}KB/{file_size//1024}KB")
+            
+            sftp.close()
+            ssh.close()
+            
+            wx.CallAfter(progress_dlg.Update, 100, "下载完成，正在播放...")
+            
+            # 使用系统默认播放器播放视频
+            if os.name == 'nt':  # Windows
+                os.startfile(local_path)
+            else:  # Mac/Linux
+                import subprocess
+                subprocess.Popen(["xdg-open", local_path])
+            
+            self.log_message(f"视频播放成功: {local_path}")
+            
+        except Exception as e:
+            wx.CallAfter(
+                wx.MessageBox,
+                f"播放视频失败: {str(e)}",
+                "错误",
+                wx.OK | wx.ICON_ERROR
+            )
+            self.log_message(f"播放视频失败: {str(e)}")
+        finally:
+            wx.CallAfter(progress_dlg.Destroy)
     
     def stop_all_processes(self):
         """停止所有运行的进程"""
