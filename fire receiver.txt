@@ -1,0 +1,460 @@
+import cv2
+import socket
+import threading
+import numpy as np
+import logging
+import time
+import os
+import winsound
+import queue
+import struct
+import sys
+
+# 检查并尝试导入scikit-learn
+try:
+    from sklearn.svm import SVC
+    from sklearn.preprocessing import StandardScaler
+    import joblib
+    sklearn_available = True
+except ImportError:
+    sklearn_available = False
+    print("警告: scikit-learn未安装，AI功能将禁用")
+
+#====================配置参数===================
+PORT = 80  # 使用80端口匹配设备端
+LOG_DIR = "./logs/"
+WINDOW_NAME = "Fire Monitoring System"
+MAX_BUFFER_SIZE = 65536 * 4  # 大缓冲区用于处理视频帧
+MIN_FRAME_WIDTH = 640
+MIN_FRAME_HEIGHT = 480
+ALARM_SOUND_DURATION = 3000  # 报警声音持续时间(ms)
+CONNECTION_TIMEOUT = 5.0  # 连接超时时间
+ALERT_COOLDOWN = 10  # 报警冷却时间(秒)
+
+#==========日志配置
+os.makedirs(LOG_DIR, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s-%(name)s-%(levelname)s-%(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(LOG_DIR, "pc_monitor.log")),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("PCMonitor")
+
+#====================帧缓冲区系统=======================
+class FrameBuffer:
+    """三缓冲系统确保稳定显示"""
+    def __init__(self, max_frames=3):
+        self.queue = queue.Queue(max_frames)
+        self.last_valid_frame = np.zeros((MIN_FRAME_HEIGHT, MIN_FRAME_WIDTH, 3), dtype=np.uint8)
+    
+    def put_frame(self, frame):
+        try:
+            self.queue.put_nowait(frame)
+            self.last_valid_frame = frame  # 更新最后有效帧
+        except queue.Full:
+            # 如果队列满，移除最旧的帧
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                pass
+            self.queue.put_nowait(frame)
+            self.last_valid_frame = frame
+    
+    def get_frame(self):
+        try:
+            return self.queue.get_nowait()
+        except queue.Empty:
+            return self.last_valid_frame  # 返回最后有效帧防止黑屏
+
+#==================视频显示管理===================
+class VideoDisplay:
+    def __init__(self):
+        # 初始化属性
+        self.status = "Initializing..."
+        self.last_alert_time = "Never"
+        self.fps = 0.0
+        self.frame_counter = 0
+        self.last_frame_time = time.time()
+        self.frame_buffer = FrameBuffer()
+        self.connection_status = "Disconnected"
+        self.last_alert = 0
+        self.alert_status = "Normal"
+        
+        # 创建窗口
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WINDOW_NAME, 800, 600)
+        self.show_default_frame()
+    
+    def show_default_frame(self):
+        """显示默认帧(避免黑屏)"""
+        self.current_frame = np.zeros((MIN_FRAME_HEIGHT, MIN_FRAME_WIDTH, 3), dtype=np.uint8)
+        self.add_status_info()
+        cv2.imshow(WINDOW_NAME, self.current_frame)
+        cv2.waitKey(1)
+    
+    def add_status_info(self, frame=None):
+        """在帧上添加状态信息"""
+        if frame is None:
+            display_frame = self.current_frame.copy()
+        else:
+            display_frame = frame.copy()
+        
+        # 状态背景条
+        cv2.rectangle(display_frame, (0, 0), (display_frame.shape[1], 180), (0, 0, 0), -1)
+        cv2.addWeighted(display_frame, 0.7, display_frame, 0.3, 0, display_frame)
+        
+        # 添加状态信息 (修改为英文)
+        cv2.putText(display_frame, f"Status: {self.status}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+        cv2.putText(display_frame, f"Connection: {self.connection_status}",
+                    (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+        cv2.putText(display_frame, f"FPS: {self.fps:.1f}",
+                    (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(display_frame, f"Last Alert: {self.last_alert_time}",
+                    (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        
+        # 报警状态显示
+        alert_color = (0, 0, 255) if self.alert_status == "FIRE ALERT!" else (0, 255, 0)
+        cv2.putText(display_frame, f"Alert Status: {self.alert_status}",
+                    (10, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.7, alert_color, 2)
+        
+        return display_frame
+    
+    def update_frame(self, frame):
+        """更新显示的帧"""
+        if frame is not None:
+            self.current_frame = self.add_status_info(frame)
+            self.frame_buffer.put_frame(self.current_frame)
+        self.update_display()
+    
+    def update_display(self):
+        """更新显示窗口"""
+        current_frame = self.frame_buffer.get_frame()
+        
+        # 更新FPS
+        current_time = time.time()
+        if current_time - self.last_frame_time >= 1.0:
+            self.fps = self.frame_counter / (current_time - self.last_frame_time)
+            self.frame_counter = 0
+            self.last_frame_time = current_time
+        
+        cv2.imshow(WINDOW_NAME, current_frame)
+        cv2.waitKey(1)
+    
+    def record_alert(self):
+        """记录报警时间并播放报警"""
+        self.last_alert_time = time.strftime("%H:%M:%S")
+        self.last_alert = time.time()
+        self.alert_status = "FIRE ALERT!"
+        
+        # 播放报警声音
+        winsound.Beep(1000, ALARM_SOUND_DURATION)  # 1000Hz
+        winsound.Beep(1500, 1000)  # 1500Hz
+        logger.warning("Fire alarm triggered!")
+        
+        # 10秒后重置报警状态
+        threading.Timer(ALERT_COOLDOWN, self.reset_alert).start()
+    
+    def reset_alert(self):
+        """重置报警状态"""
+        if time.time() - self.last_alert >= ALERT_COOLDOWN:
+            self.alert_status = "Normal"
+    
+    def update_connection_status(self, status):
+        """更新连接状态"""
+        self.connection_status = status
+        self.status = "Device connected" if "connected" in status else "Waiting for device"
+
+#==================网络服务(报警处理核心)=================
+class FireMonitorServer:
+    def __init__(self, video_display):
+        self.video_display = video_display
+        self.server_socket = None
+        self.client_socket = None
+        self.client_address = None
+        self.is_running = True
+        self.frame_header_size = 4  # 帧长度头部大小
+        self.connection_active = False
+        
+        # 初始化AI模型相关变量
+        self.fire_model = None
+        self.scaler = None
+        
+        if sklearn_available:
+            # 先初始化scaler
+            self.scaler = StandardScaler()
+            # 然后加载模型
+            self.fire_model = self.load_fire_model()
+        else:
+            logger.warning("AI模型不可用，scikit-learn未安装")
+    
+    def load_fire_model(self):
+        """创建并训练轻量级火焰检测模型"""
+        # 尝试加载已有模型
+        model_path = "fire_detection_model.pkl"
+        if os.path.exists(model_path):
+            try:
+                model = joblib.load(model_path)
+                logger.info("火焰检测模型加载成功")
+                return model
+            except:
+                logger.warning("模型加载失败，创建新模型")
+        
+        # 创建新模型（在实际应用中应使用训练数据）
+        logger.info("创建新的火焰检测模型")
+        
+        # 这里应该使用真实数据集进行训练
+        # 为演示目的，我们创建一个简单的模型
+        model = SVC(kernel='linear', probability=True)
+        
+        # 示例数据（实际应替换为真实数据）
+        # 格式：[H_mean, S_mean, V_mean, LBP1-8, Aspect_ratio, Motion]
+        X_train = np.array([
+            [20, 200, 220, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.8, 50],  # 火焰样本
+            [100, 50, 100, 0.3, 0.2, 0.1, 0.05, 0.05, 0.05, 0.1, 0.15, 1.2, 10],  # 非火焰样本
+            [25, 180, 200, 0.05, 0.1, 0.15, 0.2, 0.1, 0.1, 0.1, 0.1, 0.7, 45],  # 火焰样本
+            [110, 40, 90, 0.2, 0.3, 0.1, 0.1, 0.1, 0.05, 0.05, 0.1, 1.5, 8]   # 非火焰样本
+        ])
+        y_train = np.array([1, 0, 1, 0])  # 1=火焰, 0=非火焰
+        
+        # 数据标准化
+        self.scaler.fit(X_train)
+        X_train_scaled = self.scaler.transform(X_train)
+        
+        # 训练模型
+        model.fit(X_train_scaled, y_train)
+        
+        # 保存模型
+        joblib.dump(model, model_path)
+        logger.info("火焰检测模型创建并保存成功")
+        return model
+    
+    def start(self):
+        self.video_display.status = "Starting server..."
+        self.video_display.update_display()
+        
+        try:
+            # 创建服务器socket
+            self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind(('0.0.0.0', PORT))
+            self.server_socket.listen(1)
+            self.server_socket.settimeout(2.0)
+            
+            # 获取本机IP地址
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                # 连接到公共DNS服务器以获取本地IP
+                s.connect(("8.8.8.8", 80))
+                ip_address = s.getsockname()[0]
+            except:
+                # 回退方法
+                hostname = socket.gethostname()
+                ip_address = socket.gethostbyname(hostname)
+            finally:
+                s.close()
+            
+            self.video_display.status = f"Listening: {ip_address}:{PORT}"
+            logger.info(f"Server started at: {ip_address}:{PORT}")
+            self.video_display.update_connection_status("Waiting for device")
+            
+            while self.is_running:
+                if not self.connection_active:
+                    self.accept_client_connection()
+                
+                if self.connection_active:
+                    try:
+                        # 1. 读取4字节的数据长度
+                        header = self.recv_bytes(4)
+                        if not header:
+                            logger.info("Client closed connection")
+                            self.disconnect_client()
+                            continue
+                        
+                        data_length = struct.unpack('>I', header)[0]
+                        
+                        # 2. 读取指定长度的数据
+                        data = self.recv_bytes(data_length)
+                        if not data:
+                            self.disconnect_client()
+                            continue
+                        
+                        # 3. 判断数据类型（帧或特征）
+                        if data_length == 52:  # 特征向量长度(13个float32*4bytes)
+                            self.process_feature_data(data)
+                        else:
+                            # 尝试判断是否为报警信息
+                            try:
+                                decoded_data = data.decode('utf-8')
+                                if decoded_data.startswith('FIRE_ALERT'):
+                                    # 处理报警信息
+                                    logger.warning(f"Received fire alert: {decoded_data}")
+                                    self.video_display.record_alert()
+                                    continue
+                            except UnicodeDecodeError:
+                                # 不是文本数据，视为视频帧
+                                self.process_frame_data(data)
+                    
+                    except socket.timeout:
+                        # 超时不处理
+                        pass
+                    except ConnectionResetError:
+                        logger.warning("Connection reset")
+                        self.disconnect_client()
+                    except Exception as e:
+                        logger.error(f"Receive error: {str(e)[:200]}")
+                        self.disconnect_client()
+                else:
+                    # 没有活跃连接时更新状态
+                    self.video_display.update_connection_status("Waiting for device")
+                    time.sleep(0.5)
+        
+        except Exception as e:
+            logger.critical(f"Server error: {str(e)}")
+        finally:
+            self.stop()
+    
+    def recv_bytes(self, num_bytes):
+        """可靠地接收指定数量的字节"""
+        chunks = []
+        bytes_received = 0
+        while bytes_received < num_bytes:
+            chunk = self.client_socket.recv(min(num_bytes - bytes_received, MAX_BUFFER_SIZE))
+            if not chunk:
+                return None
+            chunks.append(chunk)
+            bytes_received += len(chunk)
+        return b"".join(chunks)
+    
+    def accept_client_connection(self):
+        """接受新的客户端连接"""
+        try:
+            self.client_socket, client_addr = self.server_socket.accept()
+            self.client_socket.settimeout(CONNECTION_TIMEOUT)
+            self.client_address = client_addr[0]
+            self.video_display.status = f"Connected: {self.client_address}"
+            self.video_display.update_connection_status(f"Connected {self.client_address}")
+            logger.info(f"Device connected: {self.client_address}")
+            self.connection_active = True
+            return True
+        except socket.timeout:
+            return False
+        except Exception as e:
+            logger.error(f"Accept connection error: {str(e)}")
+            self.connection_active = False
+            return False
+    
+    def process_frame_data(self, frame_data):
+        """处理接收到的帧数据"""
+        try:
+            # 尝试解码为图像
+            img_array = np.frombuffer(frame_data, dtype=np.uint8)
+            frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            
+            if frame is not None:
+                # 确保帧尺寸满足最小值要求
+                h, w = frame.shape[:2]
+                if w < MIN_FRAME_WIDTH or h < MIN_FRAME_HEIGHT:
+                    frame = cv2.resize(frame, (MIN_FRAME_WIDTH, MIN_FRAME_HEIGHT))
+                
+                # 更新帧计数器
+                self.video_display.frame_counter += 1
+                self.video_display.update_frame(frame)
+            else:
+                logger.warning("Frame decode failed")
+                # 保存错误数据用于调试
+                with open(os.path.join(LOG_DIR, "bad_frame.bin"), "wb") as f:
+                    f.write(frame_data)
+        except Exception as e:
+            logger.error(f"Frame process error: {str(e)}")
+    
+    def process_feature_data(self, data):
+        """处理特征向量数据"""
+        if not self.fire_model:
+            logger.warning("收到特征数据但AI模型不可用")
+            return
+            
+        try:
+            # 反序列化特征向量
+            features = np.frombuffer(data, dtype=np.float32)
+            
+            # 标准化特征
+            features_scaled = self.scaler.transform(features.reshape(1, -1))
+            
+            # 使用AI模型进行预测
+            is_fire = self.fire_model.predict(features_scaled)[0]
+            fire_prob = self.fire_model.predict_proba(features_scaled)[0][1]
+            
+            if is_fire and fire_prob > 0.7:
+                logger.warning(f"AI确认火焰! 概率: {fire_prob:.2f}")
+                self.video_display.record_alert()
+                
+        except Exception as e:
+            logger.error(f"特征处理错误: {str(e)}")
+    
+    def disconnect_client(self):
+        """断开客户端连接"""
+        self.connection_active = False
+        if self.client_socket:
+            try:
+                self.client_socket.close()
+            except:
+                pass
+            self.client_socket = None
+        self.client_address = None
+        self.video_display.status = "Waiting for device"
+        self.video_display.update_connection_status("Disconnected")
+        logger.info("Client disconnected")
+        time.sleep(1)  # 等待后重试连接
+    
+    def stop(self):
+        """停止服务器"""
+        self.is_running = False
+        self.disconnect_client()
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+            except:
+                pass
+        logger.info("Server shutdown")
+
+#==================================================================================================
+def main():
+    logger.info("Starting PC Fire Monitoring System")
+    
+    # 创建视频显示
+    display = VideoDisplay()
+    
+    # 创建并启动服务器
+    server = FireMonitorServer(display)
+    server_thread = threading.Thread(target=server.start, daemon=True)
+    server_thread.start()
+    
+    # 主显示循环
+    try:
+        while True:
+            key = cv2.waitKey(30)
+            # 处理键盘输入
+            if key == 27:  # ESC键
+                logger.info("User exit")
+                break
+            
+            # 定期更新显示
+            display.update_display()
+            
+            # 防止占用过高CPU
+            time.sleep(0.02)
+    
+    except KeyboardInterrupt:
+        logger.info("User interrupted")
+    except Exception as e:
+        logger.critical(f"Program error: {str(e)}")
+    finally:
+        cv2.destroyAllWindows()
+        logger.info("System shutdown")
+
+if __name__ == "__main__":
+    main()

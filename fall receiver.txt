@@ -1,0 +1,381 @@
+import socket
+import cv2
+import numpy as np
+import struct
+import threading
+import sys
+import time
+import winsound
+import os
+
+print("="*60)
+print("动作检测监控系统-PC接收端")
+print("="*60)
+
+# 检查操作系统类型
+IS_WINDOWS = os.name == 'nt'
+
+def get_local_ip():
+    try:
+        if IS_WINDOWS:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        else:
+            # Linux/MacOS获取IP的方法
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+    except:
+        return "0.0.0.0"
+
+pc_ip = get_local_ip()
+VIDEO_PORT = 5002
+ALARM_PORT = 5003
+RUNNING = True
+
+print(f"本机 IP: {pc_ip}")
+print(f"视频端口: {VIDEO_PORT}")
+print(f"报警端口: {ALARM_PORT}")
+print("="*60)
+print("系统初始化中...")
+
+# 报警服务器 - 接收所有类型的警报
+def start_alarm_server():
+    global RUNNING
+    print("启动报警服务器...")
+    
+    alarm_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    alarm_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    alarm_sock.bind(('0.0.0.0', ALARM_PORT))
+    alarm_sock.listen(5)
+    alarm_sock.settimeout(1.0)
+    print(f"报警服务器监听中: {pc_ip}:{ALARM_PORT}")
+    
+    try:
+        while RUNNING:
+            try:
+                conn, addr = alarm_sock.accept()
+                print(f"报警连接已建立: {addr}")
+                conn.settimeout(2.0)
+                
+                while RUNNING:
+                    try:
+                        data = conn.recv(1024)
+                        if not data:
+                            print("报警连接关闭")
+                            break
+                            
+                        # 根据警报类型播放不同的声音
+                        if data == b"FALL_DETECTED":
+                            timestamp = time.strftime('%H:%M:%S')
+                            print(f"\033[91m[{timestamp}] 摔倒检测报警!\033[0m")
+                            try:
+                                # 摔倒警报（紧急）- 高频急促蜂鸣
+                                for _ in range(3):
+                                    winsound.Beep(1200, 400)  # 1200Hz, 400ms
+                                    time.sleep(0.1)
+                            except:
+                                if IS_WINDOWS:
+                                    print("声音播放失败 - 检查winsound模块")
+                                else:
+                                    print("声音播放失败 - Linux/Mac请使用beep命令")
+                        
+                        elif data == b"SQUAT_DETECTED":
+                            timestamp = time.strftime('%H:%M:%S')
+                            print(f"\033[93m[{timestamp}] 下蹲检测报警!\033[0m")
+                            try:
+                                # 下蹲警报（提示）- 中频提示声
+                                for _ in range(2):
+                                    winsound.Beep(800, 300)  # 800Hz, 300ms
+                                    time.sleep(0.2)
+                            except:
+                                print("声音播放失败")
+                        
+                        elif data == b"TILT_DETECTED":
+                            timestamp = time.strftime('%H:%M:%S')
+                            print(f"\033[94m[{timestamp}] 身体倾斜报警!\033[0m")
+                            try:
+                                # 倾斜警报（警示）- 多频交替
+                                winsound.Beep(1000, 200)
+                                winsound.Beep(800, 200)
+                                winsound.Beep(1000, 200)
+                            except:
+                                print("声音播放失败")
+                        else:
+                            print(f"收到未知报警: {data}")
+                            
+                    except socket.timeout:
+                        continue
+                    except Exception as e:
+                        print(f"报警接收错误: {str(e)}")
+                        break
+                    
+                conn.close()
+            except socket.timeout:
+                continue
+    except Exception as e:
+        print(f"报警服务器错误: {str(e)}")
+    finally:
+        alarm_sock.close()
+        print("报警服务器结束")
+
+# 视频服务器 - 接收实时视频流
+def start_video_server():
+    global RUNNING
+    print("启动视频服务器...")
+    
+    video_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    video_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    video_sock.bind(('0.0.0.0', VIDEO_PORT))
+    video_sock.listen(5)
+    video_sock.settimeout(1.0)
+    print(f"视频服务器监听中: {pc_ip}:{VIDEO_PORT}")
+    
+    # 创建视频窗口
+    window_name = "动作检测监控系统 - 按ESC退出"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 1000, 700)
+    
+    try:
+        while RUNNING:
+            try:
+                conn, addr = video_sock.accept()
+                print(f"视频连接已建立: {addr}")
+                conn.settimeout(1.0)
+                
+                payload_size = struct.calcsize(">L")
+                data = b""
+                
+                while RUNNING:
+                    try:
+                        # 接收帧大小
+                        while len(data) < payload_size:
+                            packet = conn.recv(4096)
+                            if not packet:
+                                print("视频连接关闭")
+                                RUNNING = False
+                                break
+                            data += packet
+                            
+                        if len(data) < payload_size:
+                            continue
+                            
+                        packed_size = data[:payload_size]
+                        data = data[payload_size:]
+                        frame_size = struct.unpack(">L", packed_size)[0]
+                        
+                        # 接收帧数据
+                        while len(data) < frame_size:
+                            packet = conn.recv(4096)
+                            if not packet:
+                                print("视频连接关闭")
+                                RUNNING = False
+                                break
+                            data += packet
+                            
+                        if len(data) < frame_size:
+                            continue
+                            
+                        frame_data = data[:frame_size]
+                        data = data[frame_size:]
+                        
+                        # 解码图像
+                        img = cv2.imdecode(np.frombuffer(frame_data, np.uint8), cv2.IMREAD_COLOR)
+                        
+                        if img is not None:
+                            # 显示图像
+                            cv2.imshow(window_name, img)
+                            
+                            # 检查退出键
+                            if cv2.waitKey(1) & 0xFF == 27:
+                                print("ESC键退出")
+                                RUNNING = False
+                                break
+                        else:
+                            print("图像解码失败")
+                            
+                    except socket.timeout:
+                        continue
+                    except Exception as e:
+                        print(f"视频接收错误: {str(e)}")
+                        break
+                        
+                cv2.destroyWindow(window_name)
+                conn.close()
+            except socket.timeout:
+                continue
+    except Exception as e:
+        print(f"视频服务器错误: {str(e)}")
+    finally:
+        cv2.destroyAllWindows()
+        video_sock.close()
+        print("视频服务器结束")
+
+# 启动服务器线程
+print("="*60)
+print("启动系统线程...")
+alarm_thread = threading.Thread(target=start_alarm_server, daemon=True)
+video_thread = threading.Thread(target=start_video_server, daemon=True)
+
+alarm_thread.start()
+video_thread.start()
+
+print("系统已启动，等待设备连接...")
+print("按 Ctrl+C 退出程序")
+
+# 系统状态监控
+try:
+    while alarm_thread.is_alive() or video_thread.is_alive():
+        time.sleep(1)
+except KeyboardInterrupt:
+    RUNNING = False
+    print("\n中断信号, 关闭程序...")
+    alarm_thread.join(1.0)
+    video_thread.join(1.0)
+finally:
+    print("系统关闭")
+
+
+
+
+
+监控录像
+monitor.py
+import cv2
+import os
+import time
+from datetime import datetime, timedelta
+import threading
+import re
+
+# 配置参数
+VIDEO_DIR = "/home/long2/monitor_videos"  # 使用图片中显示的路径
+RESOLUTION = (640, 480)  # 建议分辨率
+FPS = 15                 # 帧率设置
+CLEAN_INTERVAL = 3600    # 每小时清理一次旧文件
+
+def ensure_dir_exists():
+    """确保存储目录存在"""
+    if not os.path.exists(VIDEO_DIR):
+        os.makedirs(VIDEO_DIR)
+        print(f"创建存储目录: {VIDEO_DIR}")
+
+def get_current_filename():
+    """生成带日期时间的文件名"""
+    now = datetime.now()
+    # 与图片中的文件名格式完全一致
+    return os.path.join(VIDEO_DIR, f"monitor_{now.strftime('%Y%m%d_%H')}.mp4")
+
+def clean_old_videos():
+    """立即删除超过7天的视频文件（严格日期比较）"""
+    now = datetime.now()
+    seven_days_ago = now - timedelta(days=7)
+    deleted_count = 0
+    print(f"[清理任务] 开始清理 {seven_days_ago.strftime('%Y-%m-%d')} 之前的视频文件")
+    
+    for filename in os.listdir(VIDEO_DIR):
+        if not (filename.startswith("monitor_") and filename.endswith(".mp4")):
+            continue
+            
+        try:
+            # 1. 使用正则表达式精确匹配文件名格式（图片中的格式）
+            match = re.match(r"monitor_(\d{8})_\d{2}\.mp4", filename)
+            if not match:
+                print(f"文件名格式不匹配: {filename}")
+                continue
+                
+            date_str = match.group(1)
+            
+            # 2. 解析文件创建日期（忽略小时信息）
+            file_date = datetime.strptime(date_str, "%Y%m%d")
+            
+            # 3. 计算文件保存天数（严格日期比较）
+            if file_date.date() <= (now - timedelta(days=7)).date():
+                file_path = os.path.join(VIDEO_DIR, filename)
+                os.remove(file_path)
+                print(f"已删除过期文件: {filename} (创建于: {file_date.date()})")
+                deleted_count += 1
+                
+        except Exception as e:
+            print(f"清理文件错误 {filename}: {str(e)}")
+    
+    print(f"[清理任务] 完成! 共删除 {deleted_count} 个过期文件")
+    return deleted_count > 0
+
+def record_video():
+    ensure_dir_exists()
+    
+    # 在录制开始前立即执行一次清理
+    print("启动时立即执行过期文件清理...")
+    clean_old_videos()
+    
+    cap = cv2.VideoCapture(0)  # 打开UVC摄像头
+    
+    if not cap.isOpened():
+        print("错误：无法打开摄像头！")
+        return
+
+    # 设置摄像头参数
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, RESOLUTION[0])
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, RESOLUTION[1])
+    cap.set(cv2.CAP_PROP_FPS, FPS)
+
+    # 视频编码设置 (龙芯兼容MJPG编码)
+    fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+    writer = None
+    last_hour = -1
+    last_clean_time = time.time()
+
+    print("开始监控录制...")
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("警告：获取帧失败，重试中...")
+                time.sleep(1)
+                continue
+
+            current_hour = datetime.now().hour
+            
+            # 每小时或首次启动时创建新文件
+            if writer is None or current_hour != last_hour:
+                if writer is not None:
+                    writer.release()
+                    print(f"关闭上一个视频文件")
+                
+                filename = get_current_filename()
+                writer = cv2.VideoWriter(filename, fourcc, FPS, RESOLUTION)
+                last_hour = current_hour
+                print(f"新视频文件: {filename}")
+            
+            writer.write(frame)  # 写入帧
+            
+            # 每小时自动清理旧文件
+            current_time = time.time()
+            if current_time - last_clean_time > CLEAN_INTERVAL:
+                # 记录下一个清理时间
+                next_clean_time = datetime.fromtimestamp(current_time + CLEAN_INTERVAL)
+                
+                # 在单独线程中执行清理操作
+                threading.Thread(target=clean_old_videos).start()
+                last_clean_time = current_time
+                print(f"[清理计划] 下次清理时间: {next_clean_time.strftime('%m-%d %H:%M')}")
+                
+    except KeyboardInterrupt:
+        print("监控已手动停止")
+    except Exception as e:
+        print(f"录制过程中发生错误: {str(e)}")
+    finally:
+        if cap.isOpened():
+            cap.release()
+        if writer is not None:
+            writer.release()
+        print("录制服务已终止")
+
+if __name__ == "__main__":
+    record_video()
